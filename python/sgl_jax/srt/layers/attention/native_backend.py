@@ -17,33 +17,59 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 
 logger = logging.getLogger(__name__)
 
-_LOCAL_WINDOW_ATTN_FN = None
+_LOCAL_WINDOW_ATTN_KERNELS = None
 _LOCAL_WINDOW_IMPORT_ERROR = None
 
 
-def _get_local_window_attn_fn():
-    """Lazy import of thesis2026 local window attention implementation."""
-    global _LOCAL_WINDOW_ATTN_FN, _LOCAL_WINDOW_IMPORT_ERROR
-    if _LOCAL_WINDOW_ATTN_FN is not None:
-        return _LOCAL_WINDOW_ATTN_FN
+def _get_local_window_attn_kernels():
+    """Lazy import of thesis2026 local window attention implementations."""
+    global _LOCAL_WINDOW_ATTN_KERNELS, _LOCAL_WINDOW_IMPORT_ERROR
+    if _LOCAL_WINDOW_ATTN_KERNELS is not None:
+        return _LOCAL_WINDOW_ATTN_KERNELS
     if _LOCAL_WINDOW_IMPORT_ERROR is not None:
         return None
 
     try:
-        from pattern.local_window_attention import local_window_attention_baseline
+        from pattern.local_window_attention import (
+            batched_local_window_flash_attention,
+            batched_local_window_flash_attention_trainable,
+            local_window_attention_baseline,
+        )
 
-        _LOCAL_WINDOW_ATTN_FN = local_window_attention_baseline
+        _LOCAL_WINDOW_ATTN_KERNELS = {
+            "baseline": local_window_attention_baseline,
+            "pallas": batched_local_window_flash_attention,
+            "trainable": batched_local_window_flash_attention_trainable,
+        }
         logger.info(
             "Enabled local window attention override from thesis2026 for selected layer(s)."
         )
-        return _LOCAL_WINDOW_ATTN_FN
+        return _LOCAL_WINDOW_ATTN_KERNELS
     except Exception as e:  # pragma: no cover - runtime environment dependent
         _LOCAL_WINDOW_IMPORT_ERROR = e
         logger.warning(
-            "Failed to import pattern.local_window_attention.local_window_attention_baseline: %s",
+            "Failed to import local window attention kernels from pattern.local_window_attention: %s",
             e,
         )
         return None
+
+
+def _resolve_local_window_impl() -> str:
+    impl = os.getenv("SGL_JAX_LOCAL_WINDOW_IMPL", "pallas").strip().lower()
+    if impl in ("baseline", "pallas", "trainable"):
+        return impl
+    logger.warning(
+        "Unknown SGL_JAX_LOCAL_WINDOW_IMPL=%s, falling back to pallas.",
+        impl,
+    )
+    return "pallas"
+
+
+def _resolve_effective_batch(batch_tot: int, requested: int) -> int:
+    eff = max(1, min(batch_tot, requested))
+    while eff > 1 and (batch_tot % eff) != 0:
+        eff -= 1
+    return eff
 
 
 def _should_try_local_window(layer_id: int, mode: ForwardMode) -> bool:
@@ -267,9 +293,14 @@ def forward_attention(
     v_t = jnp.transpose(v_heads, (1, 0, 2))
 
     if _should_try_local_window(layer_id, mode):
-        local_window_fn = _get_local_window_attn_fn()
-        if local_window_fn is not None:
+        local_window_kernels = _get_local_window_attn_kernels()
+        if local_window_kernels is not None:
             local_window_size = int(os.getenv("SGL_JAX_LOCAL_WINDOW_SIZE", "128"))
+            local_window_block_size = int(os.getenv("SGL_JAX_LOCAL_WINDOW_BLOCK_SIZE", "16"))
+            requested_effective_batch = int(
+                os.getenv("SGL_JAX_LOCAL_WINDOW_EFFECTIVE_BATCH", "8")
+            )
+            local_window_impl = _resolve_local_window_impl()
 
             # Keep this path JIT-safe: avoid host-side int conversions on traced values.
             # Apply local window attention over the aligned prefix [0:q_len].
@@ -277,14 +308,61 @@ def forward_attention(
             k_local = k_t[:, :q_len, :]
             v_local = v_t[:, :q_len, :]
 
-            local_out = jax.vmap(local_window_fn, in_axes=(0, 0, 0, None))(
-                q_t,
-                k_local,
-                v_local,
-                local_window_size,
-            )
-            local_out = jnp.transpose(local_out, (1, 0, 2))
-            return local_out.reshape(num_tokens, hidden_size)
+            try:
+                if local_window_impl == "baseline":
+                    local_out = jax.vmap(local_window_kernels["baseline"], in_axes=(0, 0, 0, None))(
+                        q_t,
+                        k_local,
+                        v_local,
+                        local_window_size,
+                    )
+                else:
+                    if local_window_size % local_window_block_size != 0:
+                        raise ValueError(
+                            f"window_size ({local_window_size}) must be divisible by block_size "
+                            f"({local_window_block_size})"
+                        )
+
+                    # Pallas kernels are block-tiled. Pad token dimension to tile size, then trim back.
+                    pad_tokens = (-q_len) % local_window_block_size
+                    if pad_tokens:
+                        pad_cfg = ((0, 0), (0, pad_tokens), (0, 0))
+                        q_local = jnp.pad(q_t, pad_cfg)
+                        k_local = jnp.pad(k_local, pad_cfg)
+                        v_local = jnp.pad(v_local, pad_cfg)
+                    else:
+                        q_local = q_t
+
+                    eff = _resolve_effective_batch(q_local.shape[0], requested_effective_batch)
+                    if local_window_impl == "trainable":
+                        local_out = local_window_kernels["trainable"](
+                            q_local,
+                            k_local,
+                            v_local,
+                            local_window_size,
+                            local_window_block_size,
+                            eff,
+                        )
+                    else:
+                        local_out = local_window_kernels["pallas"](
+                            q_local,
+                            k_local,
+                            v_local,
+                            local_window_size,
+                            local_window_block_size,
+                            eff,
+                        )
+                    local_out = local_out[:, :q_len, :]
+
+                local_out = jnp.transpose(local_out, (1, 0, 2))
+                return local_out.reshape(num_tokens, hidden_size)
+            except Exception as e:
+                logger.warning(
+                    "Local-window %s kernel failed for layer %s, falling back to native attention: %s",
+                    local_window_impl,
+                    layer_id,
+                    e,
+                )
 
     if scale is None:
         scale = 1.0 / jnp.sqrt(head_dim)
