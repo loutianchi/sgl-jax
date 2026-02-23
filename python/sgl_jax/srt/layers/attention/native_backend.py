@@ -1,3 +1,6 @@
+import logging
+import os
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding
@@ -10,6 +13,45 @@ from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.profiling_utils import named_scope
+
+
+logger = logging.getLogger(__name__)
+
+_LOCAL_WINDOW_ATTN_FN = None
+_LOCAL_WINDOW_IMPORT_ERROR = None
+
+
+def _get_local_window_attn_fn():
+    """Lazy import of thesis2026 local window attention implementation."""
+    global _LOCAL_WINDOW_ATTN_FN, _LOCAL_WINDOW_IMPORT_ERROR
+    if _LOCAL_WINDOW_ATTN_FN is not None:
+        return _LOCAL_WINDOW_ATTN_FN
+    if _LOCAL_WINDOW_IMPORT_ERROR is not None:
+        return None
+
+    try:
+        from pattern.local_window_attention import local_window_attention_baseline
+
+        _LOCAL_WINDOW_ATTN_FN = local_window_attention_baseline
+        logger.info(
+            "Enabled local window attention override from thesis2026 for selected layer(s)."
+        )
+        return _LOCAL_WINDOW_ATTN_FN
+    except Exception as e:  # pragma: no cover - runtime environment dependent
+        _LOCAL_WINDOW_IMPORT_ERROR = e
+        logger.warning(
+            "Failed to import pattern.local_window_attention.local_window_attention_baseline: %s",
+            e,
+        )
+        return None
+
+
+def _should_try_local_window(layer_id: int, mode: ForwardMode) -> bool:
+    if os.getenv("SGL_JAX_ENABLE_LOCAL_WINDOW_FIRST_LAYER", "0") != "1":
+        return False
+
+    target_layer = int(os.getenv("SGL_JAX_LOCAL_WINDOW_LAYER_ID", "0"))
+    return layer_id == target_layer and mode == ForwardMode.EXTEND
 
 
 class NativeAttention(AttentionBackend):
@@ -82,6 +124,7 @@ class NativeAttention(AttentionBackend):
         xai_temp_len = getattr(layer, "xai_temperature_len", None)
 
         attn_output = forward_attention(
+            layer.layer_id,
             q,
             k_buffer,
             v_buffer,
@@ -147,6 +190,7 @@ class NativeAttention(AttentionBackend):
 
 # @partial(jax.jit, static_argnames=["num_heads", "num_kv_heads", "is_causal", "mode"])
 def forward_attention(
+    layer_id: int,
     q: jax.Array,
     k_cache: jax.Array,
     v_cache: jax.Array,
@@ -221,6 +265,26 @@ def forward_attention(
     q_t = jnp.transpose(q_heads, (1, 0, 2))
     k_t = jnp.transpose(k_heads, (1, 0, 2))
     v_t = jnp.transpose(v_heads, (1, 0, 2))
+
+    if _should_try_local_window(layer_id, mode):
+        local_window_fn = _get_local_window_attn_fn()
+        if local_window_fn is not None:
+            local_window_size = int(os.getenv("SGL_JAX_LOCAL_WINDOW_SIZE", "128"))
+
+            # Keep this path JIT-safe: avoid host-side int conversions on traced values.
+            # Apply local window attention over the aligned prefix [0:q_len].
+            q_len = q_t.shape[1]
+            k_local = k_t[:, :q_len, :]
+            v_local = v_t[:, :q_len, :]
+
+            local_out = jax.vmap(local_window_fn, in_axes=(0, 0, 0, None))(
+                q_t,
+                k_local,
+                v_local,
+                local_window_size,
+            )
+            local_out = jnp.transpose(local_out, (1, 0, 2))
+            return local_out.reshape(num_tokens, hidden_size)
 
     if scale is None:
         scale = 1.0 / jnp.sqrt(head_dim)
