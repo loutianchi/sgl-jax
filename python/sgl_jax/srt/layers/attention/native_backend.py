@@ -72,12 +72,59 @@ def _resolve_effective_batch(batch_tot: int, requested: int) -> int:
     return eff
 
 
+_LOCAL_WINDOW_DEBUG = os.getenv("SGL_JAX_LOCAL_WINDOW_DEBUG", "0") == "1"
+_LOCAL_WINDOW_DEBUG_LOGGED_EVENTS: set[tuple[str, int]] = set()
+_LOCAL_WINDOW_DEBUG_SKIP_LOGGED: set[tuple[int, str]] = set()
+
+
+def _local_window_debug(
+    event: str,
+    layer_id: int,
+    mode: ForwardMode,
+    impl: str,
+    details: str = "",
+) -> None:
+    if not _LOCAL_WINDOW_DEBUG:
+        return
+
+    # Prevent log spam for hot attention path.
+    if event in ("attempt", "success"):
+        key = (event, layer_id)
+        if key in _LOCAL_WINDOW_DEBUG_LOGGED_EVENTS:
+            return
+        _LOCAL_WINDOW_DEBUG_LOGGED_EVENTS.add(key)
+
+    suffix = f" details={details}" if details else ""
+    logger.warning(
+        "[LOCAL_WINDOW_DEBUG] event=%s layer_id=%s mode=%s impl=%s%s",
+        event,
+        layer_id,
+        mode,
+        impl,
+        suffix,
+    )
+
+
 def _should_try_local_window(layer_id: int, mode: ForwardMode) -> bool:
-    if os.getenv("SGL_JAX_ENABLE_LOCAL_WINDOW_FIRST_LAYER", "0") != "1":
+    enabled = os.getenv("SGL_JAX_ENABLE_LOCAL_WINDOW_FIRST_LAYER", "0") == "1"
+    if not enabled:
         return False
 
     target_layer = int(os.getenv("SGL_JAX_LOCAL_WINDOW_LAYER_ID", "0"))
-    return layer_id == target_layer and mode == ForwardMode.EXTEND
+    should = layer_id == target_layer and mode == ForwardMode.EXTEND
+
+    if _LOCAL_WINDOW_DEBUG and layer_id == target_layer and not should:
+        key = (layer_id, str(mode))
+        if key not in _LOCAL_WINDOW_DEBUG_SKIP_LOGGED:
+            _LOCAL_WINDOW_DEBUG_SKIP_LOGGED.add(key)
+            logger.warning(
+                "[LOCAL_WINDOW_DEBUG] event=skip layer_id=%s mode=%s reason=%s",
+                layer_id,
+                mode,
+                "mode_not_extend" if mode != ForwardMode.EXTEND else "layer_not_target",
+            )
+
+    return should
 
 
 class NativeAttention(AttentionBackend):
@@ -302,6 +349,14 @@ def forward_attention(
             )
             local_window_impl = _resolve_local_window_impl()
 
+            _local_window_debug(
+                "attempt",
+                layer_id,
+                mode,
+                local_window_impl,
+                f"window={local_window_size},block={local_window_block_size},q_len={q_t.shape[1]},batch={q_t.shape[0]}",
+            )
+
             # Keep this path JIT-safe: avoid host-side int conversions on traced values.
             # Apply local window attention over the aligned prefix [0:q_len].
             q_len = q_t.shape[1]
@@ -355,8 +410,22 @@ def forward_attention(
                     local_out = local_out[:, :q_len, :]
 
                 local_out = jnp.transpose(local_out, (1, 0, 2))
+                _local_window_debug(
+                    "success",
+                    layer_id,
+                    mode,
+                    local_window_impl,
+                    f"q_len={q_len}",
+                )
                 return local_out.reshape(num_tokens, hidden_size)
             except Exception as e:
+                _local_window_debug(
+                    "fallback",
+                    layer_id,
+                    mode,
+                    local_window_impl,
+                    repr(e),
+                )
                 logger.warning(
                     "Local-window %s kernel failed for layer %s, falling back to native attention: %s",
                     local_window_impl,

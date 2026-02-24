@@ -1,4 +1,5 @@
 import logging
+import os
 from dataclasses import dataclass
 
 import jax
@@ -23,6 +24,114 @@ from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 logger = logging.getLogger(__name__)
+
+_LOCAL_WINDOW_ATTN_KERNELS = None
+_LOCAL_WINDOW_IMPORT_ERROR = None
+
+
+def _get_local_window_attn_kernels():
+    global _LOCAL_WINDOW_ATTN_KERNELS, _LOCAL_WINDOW_IMPORT_ERROR
+    if _LOCAL_WINDOW_ATTN_KERNELS is not None:
+        return _LOCAL_WINDOW_ATTN_KERNELS
+    if _LOCAL_WINDOW_IMPORT_ERROR is not None:
+        return None
+
+    try:
+        from pattern.local_window_attention import (
+            batched_local_window_flash_attention,
+            batched_local_window_flash_attention_trainable,
+            local_window_attention_baseline,
+        )
+
+        _LOCAL_WINDOW_ATTN_KERNELS = {
+            "baseline": local_window_attention_baseline,
+            "pallas": batched_local_window_flash_attention,
+            "trainable": batched_local_window_flash_attention_trainable,
+        }
+        logger.info(
+            "Enabled local window attention override from thesis2026 for selected layer(s) in FlashAttention."
+        )
+        return _LOCAL_WINDOW_ATTN_KERNELS
+    except Exception as e:  # pragma: no cover - runtime environment dependent
+        _LOCAL_WINDOW_IMPORT_ERROR = e
+        logger.warning(
+            "Failed to import local window attention kernels from pattern.local_window_attention: %s",
+            e,
+        )
+        return None
+
+
+def _resolve_local_window_impl() -> str:
+    impl = os.getenv("SGL_JAX_LOCAL_WINDOW_IMPL", "pallas").strip().lower()
+    if impl in ("baseline", "pallas", "trainable"):
+        return impl
+    logger.warning("Unknown SGL_JAX_LOCAL_WINDOW_IMPL=%s, falling back to pallas.", impl)
+    return "pallas"
+
+
+def _resolve_effective_batch(batch_tot: int, requested: int) -> int:
+    eff = max(1, min(batch_tot, requested))
+    while eff > 1 and (batch_tot % eff) != 0:
+        eff -= 1
+    return eff
+
+
+_LOCAL_WINDOW_DEBUG = os.getenv("SGL_JAX_LOCAL_WINDOW_DEBUG", "0") == "1"
+_LOCAL_WINDOW_DEBUG_LOGGED_EVENTS: set[tuple[str, int]] = set()
+_LOCAL_WINDOW_DEBUG_SKIP_LOGGED: set[tuple[int, str, str]] = set()
+
+
+def _local_window_debug(
+    event: str,
+    layer_id: int,
+    mode: ForwardMode,
+    impl: str,
+    details: str = "",
+) -> None:
+    if not _LOCAL_WINDOW_DEBUG:
+        return
+
+    if event in ("attempt", "success"):
+        key = (event, layer_id)
+        if key in _LOCAL_WINDOW_DEBUG_LOGGED_EVENTS:
+            return
+        _LOCAL_WINDOW_DEBUG_LOGGED_EVENTS.add(key)
+
+    if event == "skip":
+        key = (layer_id, str(mode), details)
+        if key in _LOCAL_WINDOW_DEBUG_SKIP_LOGGED:
+            return
+        _LOCAL_WINDOW_DEBUG_SKIP_LOGGED.add(key)
+
+    suffix = f" details={details}" if details else ""
+    logger.warning(
+        "[LOCAL_WINDOW_DEBUG] event=%s layer_id=%s mode=%s impl=%s%s",
+        event,
+        layer_id,
+        mode,
+        impl,
+        suffix,
+    )
+
+
+def _should_try_local_window(layer_id: int, mode: ForwardMode) -> bool:
+    enabled = os.getenv("SGL_JAX_ENABLE_LOCAL_WINDOW_FIRST_LAYER", "0") == "1"
+    if not enabled:
+        return False
+
+    target_layer = int(os.getenv("SGL_JAX_LOCAL_WINDOW_LAYER_ID", "0"))
+    should = layer_id == target_layer and mode == ForwardMode.EXTEND
+
+    if _LOCAL_WINDOW_DEBUG and layer_id == target_layer and not should:
+        _local_window_debug(
+            "skip",
+            layer_id,
+            mode,
+            _resolve_local_window_impl(),
+            "reason=mode_not_extend" if mode != ForwardMode.EXTEND else "reason=layer_not_target",
+        )
+
+    return should
 
 
 @register_pytree_node_class
@@ -524,6 +633,114 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.distribution,
             self.forward_metadata.custom_mask,
         )
+        if _should_try_local_window(layer.layer_id, forward_batch.forward_mode):
+            local_window_kernels = _get_local_window_attn_kernels()
+            local_window_impl = _resolve_local_window_impl()
+
+            if local_window_kernels is not None:
+                if forward_batch.batch_size != 1:
+                    _local_window_debug(
+                        "skip",
+                        layer.layer_id,
+                        forward_batch.forward_mode,
+                        local_window_impl,
+                        "reason=batch_size_not_1",
+                    )
+                else:
+                    local_window_size = int(os.getenv("SGL_JAX_LOCAL_WINDOW_SIZE", "128"))
+                    local_window_block_size = int(os.getenv("SGL_JAX_LOCAL_WINDOW_BLOCK_SIZE", "16"))
+                    requested_effective_batch = int(
+                        os.getenv("SGL_JAX_LOCAL_WINDOW_EFFECTIVE_BATCH", "8")
+                    )
+
+                    q_heads = q.reshape(q.shape[0], -1, self.head_dim)
+                    k_heads = k.reshape(k.shape[0], -1, self.head_dim)
+                    v_heads = v.reshape(v.shape[0], -1, self.head_dim)
+
+                    q_t = jnp.transpose(q_heads, (1, 0, 2))
+                    k_t = jnp.transpose(k_heads, (1, 0, 2))
+                    v_t = jnp.transpose(v_heads, (1, 0, 2))
+
+                    _local_window_debug(
+                        "attempt",
+                        layer.layer_id,
+                        forward_batch.forward_mode,
+                        local_window_impl,
+                        f"window={local_window_size},block={local_window_block_size},q_len={q_t.shape[1]},batch={q_t.shape[0]},backend=fa",
+                    )
+
+                    q_len = q_t.shape[1]
+                    k_local = k_t[:, :q_len, :]
+                    v_local = v_t[:, :q_len, :]
+
+                    try:
+                        if local_window_impl == "baseline":
+                            local_out = jax.vmap(
+                                local_window_kernels["baseline"],
+                                in_axes=(0, 0, 0, None),
+                            )(q_t, k_local, v_local, local_window_size)
+                        else:
+                            if local_window_size % local_window_block_size != 0:
+                                raise ValueError(
+                                    f"window_size ({local_window_size}) must be divisible by block_size ({local_window_block_size})"
+                                )
+
+                            pad_tokens = (-q_len) % local_window_block_size
+                            if pad_tokens:
+                                pad_cfg = ((0, 0), (0, pad_tokens), (0, 0))
+                                q_local = jnp.pad(q_t, pad_cfg)
+                                k_local = jnp.pad(k_local, pad_cfg)
+                                v_local = jnp.pad(v_local, pad_cfg)
+                            else:
+                                q_local = q_t
+
+                            eff = _resolve_effective_batch(q_local.shape[0], requested_effective_batch)
+                            if local_window_impl == "trainable":
+                                local_out = local_window_kernels["trainable"](
+                                    q_local,
+                                    k_local,
+                                    v_local,
+                                    local_window_size,
+                                    local_window_block_size,
+                                    eff,
+                                )
+                            else:
+                                local_out = local_window_kernels["pallas"](
+                                    q_local,
+                                    k_local,
+                                    v_local,
+                                    local_window_size,
+                                    local_window_block_size,
+                                    eff,
+                                )
+
+                            local_out = local_out[:, :q_len, :]
+
+                        local_out = jnp.transpose(local_out, (1, 0, 2))
+                        local_out = jnp.where(jnp.isfinite(local_out), local_out, attn_output)
+                        attn_output = local_out
+                        _local_window_debug(
+                            "success",
+                            layer.layer_id,
+                            forward_batch.forward_mode,
+                            local_window_impl,
+                            f"q_len={q_len},backend=fa",
+                        )
+                    except Exception as e:
+                        _local_window_debug(
+                            "fallback",
+                            layer.layer_id,
+                            forward_batch.forward_mode,
+                            local_window_impl,
+                            repr(e),
+                        )
+                        logger.warning(
+                            "FlashAttention local-window %s kernel failed for layer %s, keeping ragged attention output: %s",
+                            local_window_impl,
+                            layer.layer_id,
+                            e,
+                        )
+
         pad_width = (self.head_dim + 127) // 128 * 128 - self.head_dim
         if pad_width > 0:
             updated_kv_cache_fused = jnp.pad(
