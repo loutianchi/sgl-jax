@@ -105,15 +105,38 @@ def _local_window_debug(
     )
 
 
+def _resolve_target_layers() -> set[int]:
+    layer_ids_raw = os.getenv("SGL_JAX_LOCAL_WINDOW_LAYER_IDS", "").strip()
+    if layer_ids_raw:
+        out: set[int] = set()
+        for part in layer_ids_raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                out.add(int(part))
+            except ValueError:
+                logger.warning("Ignoring invalid layer id in SGL_JAX_LOCAL_WINDOW_LAYER_IDS: %s", part)
+        if out:
+            return out
+
+    fallback = os.getenv("SGL_JAX_LOCAL_WINDOW_LAYER_ID", "0").strip()
+    try:
+        return {int(fallback)}
+    except ValueError:
+        logger.warning("Invalid SGL_JAX_LOCAL_WINDOW_LAYER_ID=%s; falling back to 0", fallback)
+        return {0}
+
+
 def _should_try_local_window(layer_id: int, mode: ForwardMode) -> bool:
     enabled = os.getenv("SGL_JAX_ENABLE_LOCAL_WINDOW_FIRST_LAYER", "0") == "1"
     if not enabled:
         return False
 
-    target_layer = int(os.getenv("SGL_JAX_LOCAL_WINDOW_LAYER_ID", "0"))
-    should = layer_id == target_layer and mode == ForwardMode.EXTEND
+    target_layers = _resolve_target_layers()
+    should = layer_id in target_layers and mode == ForwardMode.EXTEND
 
-    if _LOCAL_WINDOW_DEBUG and layer_id == target_layer and not should:
+    if _LOCAL_WINDOW_DEBUG and layer_id in target_layers and not should:
         key = (layer_id, str(mode))
         if key not in _LOCAL_WINDOW_DEBUG_SKIP_LOGGED:
             _LOCAL_WINDOW_DEBUG_SKIP_LOGGED.add(key)
